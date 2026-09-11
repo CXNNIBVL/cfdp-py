@@ -549,6 +549,16 @@ class DestHandler:
     def __non_idle_fsm(self, packet: GenericPduPacket | None) -> None:
         self._assert_all_packets_were_sent()
         pdu_holder = PduHolder(packet)
+        if self._is_duplicate_eof_pdu(pdu_holder):
+            # CFDP 4.7.2: every EOF PDU must be acknowledged. Reaching this point means our
+            # previous ACK did not arrive, because the sender only retransmits the EOF on its
+            # positive ACK timer. Answering it again is the only thing that breaks the deadlock:
+            # otherwise the sender retransmits to its limit and declares a fault at the end of an
+            # otherwise successful transfer. The transaction state itself is left alone, the EOF
+            # was already fully processed when the first copy arrived.
+            self._prepare_eof_ack_packet(pdu_holder.to_eof_pdu().condition_code)
+            packet = None
+            pdu_holder = PduHolder(None)
         if (
             self.states.step
             in [
@@ -560,7 +570,12 @@ class DestHandler:
             self._handle_fd_or_eof_pdu(pdu_holder)
         if self.states.step == TransactionStep.WAITING_FOR_METADATA:
             self._handle_waiting_for_missing_metadata(pdu_holder)
-            if self._params.acked_params.deferred_lost_segment_detection_active:
+            # The metadata handling can leave this step, in which case the deferred procedure is
+            # serviced by the step which was entered instead.
+            if (
+                self.states.step == TransactionStep.WAITING_FOR_METADATA
+                and self._params.acked_params.deferred_lost_segment_detection_active
+            ):
                 self._deferred_lost_segment_handling()
         if self.states.step == TransactionStep.RECV_FILE_DATA_WITH_CHECK_LIMIT_HANDLING:
             self._check_limit_handling()
@@ -576,6 +591,26 @@ class DestHandler:
             self._handle_finished_pdu_sent()
         if self.states.step == TransactionStep.WAITING_FOR_FINISHED_ACK:
             self._handle_waiting_for_finished_ack(pdu_holder)
+
+    def _is_duplicate_eof_pdu(self, pdu_holder: PduHolder) -> bool:
+        """Whether this is an EOF PDU for a step which already consumed one.
+
+        The steps which do handle an EOF PDU themselves are the ones still receiving file data
+        and the one waiting for a missing metadata PDU.
+        """
+        if pdu_holder.pdu is None or self.transmission_mode != TransmissionMode.ACKNOWLEDGED:
+            return False
+        return (
+            pdu_holder.pdu_type == PduType.FILE_DIRECTIVE
+            and pdu_holder.pdu_directive_type == DirectiveType.EOF_PDU
+            and self.states.step
+            in [
+                TransactionStep.WAITING_FOR_MISSING_DATA,
+                TransactionStep.TRANSFER_COMPLETION,
+                TransactionStep.SENDING_FINISHED_PDU,
+                TransactionStep.WAITING_FOR_FINISHED_ACK,
+            ]
+        )
 
     def _assert_all_packets_were_sent(self) -> None:
         """Advance the internal FSM after all packets to be sent were retrieved from the handler."""
@@ -608,6 +643,10 @@ class DestHandler:
 
     # This function is only called in acknowledged mode.
     def _handle_eof_without_previous_metadata(self, eof_pdu: EofPdu) -> None:
+        # The checksum has to be retained here just like in the regular EOF handler. Without it
+        # the transfer completes against the empty default and reports a checksum failure for a
+        # file which arrived intact.
+        self._params.fp.crc32 = eof_pdu.file_checksum
         self._params.fp.progress = eof_pdu.file_size
         self._params.fp.file_size = eof_pdu.file_size
         self._params.acked_params.metadata_missing = True
@@ -780,6 +819,12 @@ class DestHandler:
             self._handle_metadata_packet(packet_holder.to_metadata_pdu())
             # Reception of missing segments resets the NAK activity parameters. See CFDP 4.6.4.7.
             if self._params.acked_params.deferred_lost_segment_detection_active:
+                # The EOF PDU was already handled and acknowledged, so the sender has no reason
+                # to send another one. _handle_metadata_packet moves the step back to
+                # RECEIVING_FILE_DATA, which waits for exactly that and would strand the
+                # transaction with its remaining gaps never re-requested. The metadata is no
+                # longer missing, so continue the deferred procedure for the file data.
+                self.states.step = TransactionStep.WAITING_FOR_MISSING_DATA
                 self._reset_nak_activity_parameters()
         elif packet_holder.pdu_directive_type == DirectiveType.EOF_PDU:  # type: ignore
             self._handle_eof_without_previous_metadata(packet_holder.to_eof_pdu())
@@ -1077,11 +1122,16 @@ class DestHandler:
         self._params.acked_params.last_end_offset = self._params.fp.file_size
         self._deferred_lost_segment_handling()
 
-    def _prepare_eof_ack_packet(self) -> None:
+    def _prepare_eof_ack_packet(self, condition_code: ConditionCode | None = None) -> None:
+        """``condition_code`` overrides the condition code of the acknowledged EOF PDU. It is
+        needed for a duplicate EOF, where the transaction's own condition code may already have
+        moved on (a cancellation, for example) and would misreport what is being acknowledged."""
         ack_pdu = AckPdu(
             self._params.pdu_conf,
             DirectiveType.EOF_PDU,
-            self._params.finished_params.condition_code,
+            condition_code
+            if condition_code is not None
+            else self._params.finished_params.condition_code,
             TransactionStatus.ACTIVE,
         )
         self._add_packet_to_be_sent(ack_pdu)

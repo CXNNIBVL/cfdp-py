@@ -28,6 +28,7 @@ from spacepackets.cfdp.pdu import (
     EofPdu,
     FileDataPdu,
     FileStatus,
+    FinishedPdu,
     MetadataParams,
     MetadataPdu,
     PduHolder,
@@ -203,6 +204,34 @@ class _TransferFieldWrapper:
 class FsmResult:
     def __init__(self, states: SourceStateWrapper):
         self.states = states
+
+
+def acknowledge_inactive_finished_pdu(
+    finished_pdu: FinishedPdu, status: TransactionStatus
+) -> AckPdu:
+    """Counterpart of :py:func:`cfdppy.handler.dest.acknowledge_inactive_eof_pdu` for the sending
+    entity.
+
+    A source handler completes and resets as soon as it has queued the ACK for the Finished PDU,
+    so it retains no state to answer with if that ACK is lost. The receiving entity retransmits
+    its Finished PDU on its positive ACK timer and will otherwise declare
+    ``POSITIVE_ACK_LIMIT_REACHED`` at the end of a transfer which actually succeeded, so the
+    application has to acknowledge a Finished PDU for an inactive transaction on the handler's
+    behalf. Everything needed for the ACK is contained in the Finished PDU itself.
+
+    The :py:class:`spacepackets.cfdp.pdu.ack.TransactionStatus` is user provided with the same
+    options documented for :py:func:`cfdppy.handler.dest.acknowledge_inactive_eof_pdu`.
+    """
+    if status == TransactionStatus.ACTIVE:
+        raise ValueError("invalid transaction status for inactive transaction")
+    pdu_conf = finished_pdu.pdu_header.pdu_conf
+    pdu_conf.direction = Direction.TOWARDS_RECEIVER
+    return AckPdu(
+        pdu_conf,
+        DirectiveType.FINISHED_PDU,
+        finished_pdu.condition_code,
+        status,
+    )
 
 
 class SourceHandler:

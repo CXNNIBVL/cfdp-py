@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 # [unreleased]
 
+## Added
+
+- `cfdppy.handler.source.acknowledge_inactive_finished_pdu`, the counterpart of the existing
+  `acknowledge_inactive_eof_pdu`. A source handler resets as soon as it has queued the ACK for
+  the Finished PDU, so it retains no state to answer a retransmission of that Finished PDU if
+  the ACK was lost. Without an acknowledgment the receiving entity retransmits to its positive
+  ACK limit and declares `POSITIVE_ACK_LIMIT_REACHED` at the end of a transfer which actually
+  succeeded.
+
+## Fixed
+
+- The destination handler now re-acknowledges a duplicate EOF PDU received in the
+  `WAITING_FOR_MISSING_DATA`, `TRANSFER_COMPLETION`, `SENDING_FINISHED_PDU` and
+  `WAITING_FOR_FINISHED_ACK` steps. Per CFDP 4.7.2 every EOF PDU must be acknowledged, and a
+  duplicate means the previous ACK was lost: the sender retransmits the EOF on its positive ACK
+  timer and would otherwise reach its limit while the receiver silently discarded every copy.
+  The transaction state is left untouched, only the ACK is re-issued, and the ACK carries the
+  condition code of the EOF PDU it acknowledges.
+- A metadata PDU which arrives while the deferred lost segment procedure is active no longer
+  moves the destination handler back to `RECEIVING_FILE_DATA`. The EOF PDU has already been
+  handled and acknowledged at that point, so the sender has no reason to send another one and
+  the handler waited for it forever with its remaining gaps never re-requested. It now continues
+  in `WAITING_FOR_MISSING_DATA`.
+- The destination handler retains the checksum of an EOF PDU which arrived before the metadata
+  PDU. It was dropped, so a transaction which recovered from a lost metadata PDU completed
+  against the empty default checksum and reported `FILE_CHECKSUM_FAILURE` for a file that had
+  arrived intact.
+
 # [v0.7.0] 2026-09-08
 
 - Bump allowed `spacepackets` to >=0.30, <0.33

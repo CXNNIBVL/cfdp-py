@@ -9,7 +9,12 @@ from cfdppy.mib import (
 from .common import PacketDestination, get_packet_destination
 from .dest import DestHandler, DestStateWrapper
 from .dest import TransactionStep as DestTransactionStep
-from .source import FsmResult, SourceHandler, SourceStateWrapper
+from .source import (
+    FsmResult,
+    SourceHandler,
+    SourceStateWrapper,
+    acknowledge_inactive_finished_pdu,
+)
 from .source import TransactionStep as SourceTransactionStep
 
 __all__ = [
@@ -25,5 +30,6 @@ __all__ = [
     "SourceHandler",
     "SourceStateWrapper",
     "SourceTransactionStep",
+    "acknowledge_inactive_finished_pdu",
     "get_packet_destination",
 ]
