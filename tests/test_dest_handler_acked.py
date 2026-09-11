@@ -1,5 +1,6 @@
 import struct
 import time
+from unittest.mock import MagicMock
 
 import fastcrc
 from spacepackets.cfdp import (
@@ -7,6 +8,7 @@ from spacepackets.cfdp import (
     ConditionCode,
     DirectiveType,
     EntityIdTlv,
+    FaultHandlerCode,
     PduType,
     TransmissionMode,
 )
@@ -21,10 +23,10 @@ from spacepackets.cfdp.pdu import (
 )
 
 from cfdppy.defs import CfdpState
-from cfdppy.handler.dest import FsmResult, TransactionStep
+from cfdppy.handler.dest import DestHandler, FsmResult, TransactionStep
 from cfdppy.user import MetadataRecvParams, TransactionFinishedParams
 
-from .test_dest_handler import TestDestHandlerBase
+from .test_dest_handler import CheckTimerProviderForTest, TestDestHandlerBase
 
 
 class TestDestHandlerAcked(TestDestHandlerBase):
@@ -592,6 +594,106 @@ class TestDestHandlerAcked(TestDestHandlerBase):
             ConditionCode.POSITIVE_ACK_LIMIT_REACHED,
             DeliveryCode.DATA_COMPLETE,
             FileStatus.FILE_RETAINED,
+        )
+
+    def test_positive_ack_limit_for_cancel_finished_pdu_abandons_transaction(self):
+        """CFDP 4.11.2.2.3: a fault declared while transferring the cancel PDU - the Finished
+        (cancel) PDU at the receiving entity - must abandon the transaction. Restarting the
+        positive ACK procedure for it instead loops forever: the handler never leaves
+        WAITING_FOR_FINISHED_ACK, so it can never accept another transaction, and it emits a
+        Finished PDU and a notice of completion on every single expiration."""
+        self.fault_handler.abandoned_cb = MagicMock()
+        self._generic_regular_transfer_init(0)
+        fsm_res = self._generic_insert_eof_pdu(0, NULL_CHECKSUM_U32)
+        self._generic_verify_eof_ack_packet(fsm_res, TransactionStep.WAITING_FOR_FINISHED_ACK)
+        self._generic_no_error_finished_pdu_check_acked(fsm_res)
+        self._generic_verify_transfer_completion(fsm_res, b"")
+        self.assertEqual(self.cfdp_user.transaction_finished_indication.call_count, 1)
+
+        # The sender never acknowledges. The first expiration retransmits the Finished PDU.
+        time.sleep(self.timeout_positive_ack_procedure_seconds * 1.1)
+        fsm_res = self.dest_handler.state_machine()
+        self._state_checker(fsm_res, 1, CfdpState.BUSY, TransactionStep.WAITING_FOR_FINISHED_ACK)
+        self.dest_handler.get_next_packet()
+
+        # The second one reaches the limit, which cancels the transaction and issues a
+        # Finished (cancel) PDU. That PDU gets its own positive ACK procedure.
+        time.sleep(self.timeout_positive_ack_procedure_seconds * 1.1)
+        fsm_res = self.dest_handler.state_machine()
+        self._generic_finished_pdu_with_error_check(
+            fsm_res,
+            ConditionCode.POSITIVE_ACK_LIMIT_REACHED,
+            DeliveryCode.DATA_COMPLETE,
+            FileStatus.FILE_RETAINED,
+        )
+
+        # One retransmission of the Finished (cancel) PDU ...
+        time.sleep(self.timeout_positive_ack_procedure_seconds * 1.1)
+        fsm_res = self.dest_handler.state_machine()
+        self._state_checker(fsm_res, 1, CfdpState.BUSY, TransactionStep.WAITING_FOR_FINISHED_ACK)
+        self.dest_handler.get_next_packet()
+
+        # ... and then the transaction is abandoned and the handler is usable again.
+        time.sleep(self.timeout_positive_ack_procedure_seconds * 1.1)
+        fsm_res = self.dest_handler.state_machine()
+        self._state_checker(fsm_res, 0, CfdpState.IDLE, TransactionStep.IDLE)
+        self.fault_handler.abandoned_cb.assert_called_once()
+        self.assertEqual(
+            self.fault_handler.abandoned_cb.call_args.args[1],
+            ConditionCode.POSITIVE_ACK_LIMIT_REACHED,
+        )
+        # The notice of completion must not be repeated per expiration.
+        self.assertEqual(self.cfdp_user.transaction_finished_indication.call_count, 2)
+
+    def test_positive_ack_limit_abandon_fault_handler_does_not_crash(self):
+        """A user which maps POSITIVE_ACK_LIMIT_REACHED to ABANDON_TRANSACTION resets the handler
+        from inside the fault declaration, so the positive ACK procedure must not keep working on
+        the discarded transaction parameters afterwards."""
+        self.local_cfg.default_fault_handlers.set_handler(
+            ConditionCode.POSITIVE_ACK_LIMIT_REACHED, FaultHandlerCode.ABANDON_TRANSACTION
+        )
+        self._generic_regular_transfer_init(0)
+        fsm_res = self._generic_insert_eof_pdu(0, NULL_CHECKSUM_U32)
+        self._generic_verify_eof_ack_packet(fsm_res, TransactionStep.WAITING_FOR_FINISHED_ACK)
+        self._generic_no_error_finished_pdu_check_acked(fsm_res)
+        self._generic_verify_transfer_completion(fsm_res, b"")
+        for _ in range(self.remote_cfg.positive_ack_timer_expiration_limit):
+            time.sleep(self.timeout_positive_ack_procedure_seconds * 1.1)
+            fsm_res = self.dest_handler.state_machine()
+            while self.dest_handler.num_packets_ready > 0:
+                self.dest_handler.get_next_packet()
+        self._state_checker(None, 0, CfdpState.IDLE, TransactionStep.IDLE)
+
+    def test_lost_segment_handling_clears_gap_matching_last_received_window(self):
+        """White box regression test. On a lossy link a span can end up being both the most
+        recently received window and a tracked gap. The removal used to be decided by comparing
+        the end of the received segment against the START of that window, which such a
+        retransmission never satisfies, so the gap stayed in the tracker: the destination
+        re-requested data it had already written on every NAK round until it hit its NAK limit,
+        with the transfer stuck at full progress."""
+        self._generic_regular_transfer_init(12)
+        acked = self.dest_handler._params.acked_params
+        acked.lost_seg_tracker.add_lost_segment((8, 12))
+        acked.last_start_offset = 8
+        acked.last_end_offset = 12
+
+        self.dest_handler._lost_segment_handling(8, 4)
+        self.assertEqual(acked.lost_seg_tracker.lost_segments, [])
+
+    def test_lost_segment_tracker_is_not_shared_between_handlers(self):
+        """The tracker used to be a mutable dataclass default, so it was created once at class
+        definition time and shared by every parameter set: all handlers in a process, and every
+        transaction of a single handler, accumulated their gaps in the same list."""
+        other_handler = DestHandler(
+            self.local_cfg,
+            self.cfdp_user,
+            self.remote_cfg_table,
+            CheckTimerProviderForTest(timeout_dest_entity_ms=self.timeout_check_limit_handling_ms),
+        )
+        self.dest_handler._params.acked_params.lost_seg_tracker.add_lost_segment((0, 4))
+        self.assertEqual(
+            other_handler._params.acked_params.lost_seg_tracker.lost_segments,
+            [],
         )
 
     def test_metadata_only_transfer(self):

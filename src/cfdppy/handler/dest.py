@@ -236,7 +236,11 @@ class LostSegmentTracker:
 
 @dataclass
 class _AckedModeParams:
-    lost_seg_tracker: LostSegmentTracker = field(default=LostSegmentTracker())
+    # default_factory, not default: a mutable default is created once at class definition time
+    # and shared by every _AckedModeParams instance, so all destination handlers in a process -
+    # and every transaction of a single handler, since a reset builds a new parameter set -
+    # accumulated their lost segments in one list.
+    lost_seg_tracker: LostSegmentTracker = field(default_factory=LostSegmentTracker)
     # Extra parameter: Missing metadata is not tracked inside the lost segment tracker, so we
     # need an extra parameter for this.
     metadata_missing: bool = False
@@ -867,6 +871,10 @@ class DestHandler:
                 >= self._params.remote_cfg.positive_ack_timer_expiration_limit
             ):
                 self._declare_fault(ConditionCode.POSITIVE_ACK_LIMIT_REACHED)
+                if self.states.state == CfdpState.IDLE:
+                    # The fault handler abandoned the transaction, so there are no transaction
+                    # parameters left to work on.
+                    return None
                 # This is a bit of a hack: We want the transfer completion and the corresponding
                 # Finished PDU to be re-sent in the same FSM cycle. However, the call
                 # order in the FSM prevents this from happening, so we just call the state machine
@@ -933,8 +941,12 @@ class DestHandler:
     def _lost_segment_handling(self, offset: int, data_len: int) -> None:
         """Lost segment detection: 4.6.4.3.1 a) and b) are covered by this code. c) is covered
         by dedicated code which is run when the EOF PDU is handled."""
-        if offset > self._params.acked_params.last_end_offset:
-            lost_segment = (self._params.acked_params.last_end_offset, offset)
+        # The end of the most recently received segment has to be sampled before the bookkeeping
+        # below updates it, because the decision whether this PDU extends the forward flow or
+        # fills an existing gap depends on the previous value.
+        previous_end_offset = self._params.acked_params.last_end_offset
+        if offset > previous_end_offset:
+            lost_segment = (previous_end_offset, offset)
             self._params.acked_params.lost_seg_tracker.add_lost_segment(lost_segment)
             assert self._params.remote_cfg is not None
             if self._params.remote_cfg.immediate_nak_mode:
@@ -946,11 +958,17 @@ class DestHandler:
                         segment_requests=[lost_segment],
                     )
                 )
-        if offset >= self._params.acked_params.last_end_offset:
+        if offset >= previous_end_offset:
             self._params.acked_params.last_start_offset = offset
             self._params.acked_params.last_end_offset = offset + data_len
-        if offset + data_len <= self._params.acked_params.last_start_offset:
-            # Might be a re-requested FD PDU.
+        elif offset + data_len <= previous_end_offset:
+            # The segment lies inside what was already received, so it can only be filling a gap:
+            # a re-requested FD PDU, or one which arrived out of order. This used to be compared
+            # against last_start_offset, which is the start of the most recently received segment
+            # rather than the end of the received region. A retransmission which exactly refilled
+            # that most recent window therefore matched none of the branches and the gap stayed in
+            # the tracker, so the destination re-requested the same segment on every NAK round
+            # until it reached its NAK limit, even though the data had arrived and been written.
             removed = self._params.acked_params.lost_seg_tracker.remove_lost_segment(
                 (offset, offset + data_len)
             )
@@ -1236,7 +1254,8 @@ class DestHandler:
         if fh is None:
             raise ValueError(f"invalid condition code {cond!r} for fault declaration")
         if fh == FaultHandlerCode.NOTICE_OF_CANCELLATION:
-            self._notice_of_cancellation(cond)
+            if not self._notice_of_cancellation(cond):
+                return fh
         elif fh == FaultHandlerCode.NOTICE_OF_SUSPENSION:
             self._notice_of_suspension()
         elif fh == FaultHandlerCode.ABANDON_TRANSACTION:
@@ -1244,10 +1263,31 @@ class DestHandler:
         self.cfg.default_fault_handlers.report_fault(transaction_id, cond, progress)
         return fh
 
-    def _notice_of_cancellation(self, condition_code: ConditionCode) -> None:
+    def _notice_of_cancellation(self, condition_code: ConditionCode) -> bool:
+        """Returns whether the fault declaration handler can continue normally."""
+        # CFDP 4.11.2.2.3: any fault declared in the course of transferring the cancel PDU must
+        # result in abandonment of the transaction. At the receiving entity that cancel PDU is
+        # the Finished (cancel) PDU, and the fault in question is the POSITIVE_ACK_LIMIT_REACHED
+        # of its own positive ACK procedure.
+        #
+        # Without this the transaction is cancelled again, which re-runs the notice of completion
+        # and re-sends the Finished PDU, and _start_positive_ack_procedure resets the ACK counter
+        # to zero. The handler then never leaves WAITING_FOR_FINISHED_ACK: it emits a Finished PDU
+        # and a transaction finished indication on every expiration, for as long as the process
+        # lives, and can never accept another transaction. The source handler already implements
+        # this rule for its own EOF (cancel) PDU.
+        if self._params.completion_disposition == CompletionDisposition.CANCELED:
+            assert self._params.transaction_id is not None
+            # Still report it, so the abandonment is not silent.
+            self.cfg.default_fault_handlers.abandoned_cb(
+                self._params.transaction_id, condition_code, self._params.fp.progress
+            )
+            self._abandon_transaction()
+            return False
         self.states.step = TransactionStep.TRANSFER_COMPLETION
         self._params.finished_params.condition_code = condition_code
         self._params.completion_disposition = CompletionDisposition.CANCELED
+        return True
 
     def _notice_of_suspension(self) -> None:
         # TODO: Implement
