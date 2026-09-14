@@ -1,5 +1,6 @@
 import struct
 import time
+from unittest.mock import MagicMock
 
 import fastcrc
 from spacepackets.cfdp import (
@@ -7,6 +8,7 @@ from spacepackets.cfdp import (
     ConditionCode,
     DirectiveType,
     EntityIdTlv,
+    FaultHandlerCode,
     PduType,
     TransmissionMode,
 )
@@ -21,10 +23,10 @@ from spacepackets.cfdp.pdu import (
 )
 
 from cfdppy.defs import CfdpState
-from cfdppy.handler.dest import FsmResult, TransactionStep
+from cfdppy.handler.dest import DestHandler, FsmResult, TransactionStep
 from cfdppy.user import MetadataRecvParams, TransactionFinishedParams
 
-from .test_dest_handler import TestDestHandlerBase
+from .test_dest_handler import CheckTimerProviderForTest, TestDestHandlerBase
 
 
 class TestDestHandlerAcked(TestDestHandlerBase):
@@ -370,6 +372,130 @@ class TestDestHandlerAcked(TestDestHandlerBase):
         self._generic_verify_transfer_completion(fsm_res, b"")
         self._generic_insert_finished_pdu_ack(finished_pdu)
 
+    def test_duplicate_eof_is_acknowledged_while_waiting_for_finished_ack(self):
+        """CFDP 4.7.2: every EOF PDU must be acknowledged. If our ACK is lost, the sender
+        retransmits the EOF until its positive ACK limit, so a destination which has already
+        moved on to waiting for the Finished ACK still has to answer it."""
+        file_content = b"Hello World!"
+        with open(self.src_file_path, "wb") as of:
+            of.write(file_content)
+        crc32_bytes = struct.pack("!I", fastcrc.crc32.iso_hdlc(file_content))
+        self._generic_regular_transfer_init(len(file_content))
+        self._insert_file_segment(file_content, 0)
+        fsm_res = self._generic_insert_eof_pdu(len(file_content), crc32_bytes)
+        self._generic_verify_eof_ack_packet(fsm_res, TransactionStep.WAITING_FOR_FINISHED_ACK)
+        finished_pdu = self._generic_no_error_finished_pdu_check_acked(fsm_res)
+        self._generic_verify_transfer_completion(fsm_res, file_content)
+
+        # The sender never saw our ACK and retransmits the EOF PDU.
+        eof_pdu = EofPdu(
+            file_size=len(file_content),
+            file_checksum=crc32_bytes,
+            pdu_conf=self.src_pdu_conf,
+        )
+        fsm_res = self.dest_handler.state_machine(eof_pdu)
+        self._state_checker(fsm_res, 1, CfdpState.BUSY, TransactionStep.WAITING_FOR_FINISHED_ACK)
+        next_pdu = self.dest_handler.get_next_packet()
+        assert next_pdu is not None
+        self.assertEqual(next_pdu.pdu_directive_type, DirectiveType.ACK_PDU)
+        ack_pdu = next_pdu.to_ack_pdu()
+        self.assertEqual(ack_pdu.directive_code_of_acked_pdu, DirectiveType.EOF_PDU)
+        self.assertEqual(ack_pdu.condition_code_of_acked_pdu, ConditionCode.NO_ERROR)
+        self.assertEqual(ack_pdu.transaction_status, TransactionStatus.ACTIVE)
+        # The duplicate must not re-run the completion procedures.
+        self.cfdp_user.transaction_finished_indication.assert_called_once()
+        self._generic_insert_finished_pdu_ack(finished_pdu)
+
+    def test_duplicate_eof_is_acknowledged_while_sending_finished_pdu(self):
+        """Same as above, but the duplicate arrives one step earlier, while the Finished PDU is
+        still waiting to be retrieved."""
+        file_content = b"Hello World!"
+        with open(self.src_file_path, "wb") as of:
+            of.write(file_content)
+        crc32_bytes = struct.pack("!I", fastcrc.crc32.iso_hdlc(file_content))
+        self._generic_regular_transfer_init(len(file_content))
+        self._insert_file_segment(file_content[0:5], 0)
+        fsm_res = self._generic_insert_eof_pdu(len(file_content), crc32_bytes)
+        self._generic_verify_eof_ack_packet(fsm_res, TransactionStep.WAITING_FOR_MISSING_DATA)
+        self._generic_verify_missing_segment_requested(
+            0, len(file_content), [(5, len(file_content))]
+        )
+        # A duplicate EOF during the deferred lost segment procedure has to be acknowledged too,
+        # without restarting the procedure.
+        eof_pdu = EofPdu(
+            file_size=len(file_content),
+            file_checksum=crc32_bytes,
+            pdu_conf=self.src_pdu_conf,
+        )
+        fsm_res = self.dest_handler.state_machine(eof_pdu)
+        self._state_checker(fsm_res, 1, CfdpState.BUSY, TransactionStep.WAITING_FOR_MISSING_DATA)
+        next_pdu = self.dest_handler.get_next_packet()
+        assert next_pdu is not None
+        self.assertEqual(next_pdu.pdu_directive_type, DirectiveType.ACK_PDU)
+        self.assertEqual(next_pdu.to_ack_pdu().directive_code_of_acked_pdu, DirectiveType.EOF_PDU)
+        # The remaining segment still completes the transfer.
+        fsm_res = self._insert_file_segment(
+            file_content[5:],
+            5,
+            expected_packets=1,
+            expected_step=TransactionStep.WAITING_FOR_FINISHED_ACK,
+        )
+        finished_pdu = self._generic_no_error_finished_pdu_check_acked(fsm_res)
+        self._generic_verify_transfer_completion(fsm_res, file_content)
+        self._generic_insert_finished_pdu_ack(finished_pdu)
+
+    def test_late_metadata_keeps_deferred_lost_segment_procedure_running(self):
+        """The metadata PDU is lost and only retransmitted after the EOF PDU has been handled.
+        The sender has its EOF ACK by then and will not send another one, so the destination has
+        to stay in the deferred lost segment procedure instead of waiting for an EOF which will
+        never arrive again."""
+        file_content = b"Hello World!"
+        with open(self.src_file_path, "wb") as of:
+            of.write(file_content)
+        crc32_bytes = struct.pack("!I", fastcrc.crc32.iso_hdlc(file_content))
+        # The metadata PDU was lost, so the transaction starts from a file data PDU.
+        self._insert_file_segment(
+            file_content[0:2],
+            0,
+            expected_packets=1,
+            check_indication=False,
+            expected_step=TransactionStep.WAITING_FOR_METADATA,
+        )
+        self._generic_verify_missing_segment_requested(0, 2, [(0, 0), (0, 2)])
+
+        # The EOF arrives before the metadata retransmission does.
+        fsm_res = self._generic_insert_eof_pdu(len(file_content), crc32_bytes)
+        self._generic_eof_recv_indication_check(fsm_res)
+        self._generic_verify_eof_ack_packet(fsm_res, TransactionStep.WAITING_FOR_METADATA)
+        self.assertTrue(self.dest_handler.deferred_lost_segment_procedure_active)
+        self._generic_verify_missing_segment_requested(
+            0, len(file_content), [(0, 0), (0, len(file_content))]
+        )
+
+        # The metadata retransmission completes the transaction setup. The deferred procedure has
+        # to keep running for the file data which is still missing.
+        fsm_res = self._generic_transfer_init(
+            len(file_content),
+            expected_init_packets=0,
+            expected_init_state=CfdpState.BUSY,
+            expected_init_step=TransactionStep.WAITING_FOR_METADATA,
+            expected_file_size=len(file_content),
+        )
+        self._state_checker(fsm_res, 0, CfdpState.BUSY, TransactionStep.WAITING_FOR_MISSING_DATA)
+        self.assertTrue(self.dest_handler.deferred_lost_segment_procedure_active)
+
+        # The re-requested file data completes the transfer. The checksum from the EOF PDU has to
+        # have survived the metadata-less start, otherwise this reports a checksum failure.
+        fsm_res = self._insert_file_segment(
+            file_content,
+            0,
+            expected_packets=1,
+            expected_step=TransactionStep.WAITING_FOR_FINISHED_ACK,
+        )
+        finished_pdu = self._generic_no_error_finished_pdu_check_acked(fsm_res)
+        self._generic_verify_transfer_completion(fsm_res, file_content)
+        self._generic_insert_finished_pdu_ack(finished_pdu)
+
     def _generic_deferred_lost_segment_handling_with_timeout(self, file_content: bytes):
         with open(self.src_file_path, "wb") as of:
             of.write(file_content)
@@ -468,6 +594,106 @@ class TestDestHandlerAcked(TestDestHandlerBase):
             ConditionCode.POSITIVE_ACK_LIMIT_REACHED,
             DeliveryCode.DATA_COMPLETE,
             FileStatus.FILE_RETAINED,
+        )
+
+    def test_positive_ack_limit_for_cancel_finished_pdu_abandons_transaction(self):
+        """CFDP 4.11.2.2.3: a fault declared while transferring the cancel PDU - the Finished
+        (cancel) PDU at the receiving entity - must abandon the transaction. Restarting the
+        positive ACK procedure for it instead loops forever: the handler never leaves
+        WAITING_FOR_FINISHED_ACK, so it can never accept another transaction, and it emits a
+        Finished PDU and a notice of completion on every single expiration."""
+        self.fault_handler.abandoned_cb = MagicMock()
+        self._generic_regular_transfer_init(0)
+        fsm_res = self._generic_insert_eof_pdu(0, NULL_CHECKSUM_U32)
+        self._generic_verify_eof_ack_packet(fsm_res, TransactionStep.WAITING_FOR_FINISHED_ACK)
+        self._generic_no_error_finished_pdu_check_acked(fsm_res)
+        self._generic_verify_transfer_completion(fsm_res, b"")
+        self.assertEqual(self.cfdp_user.transaction_finished_indication.call_count, 1)
+
+        # The sender never acknowledges. The first expiration retransmits the Finished PDU.
+        time.sleep(self.timeout_positive_ack_procedure_seconds * 1.1)
+        fsm_res = self.dest_handler.state_machine()
+        self._state_checker(fsm_res, 1, CfdpState.BUSY, TransactionStep.WAITING_FOR_FINISHED_ACK)
+        self.dest_handler.get_next_packet()
+
+        # The second one reaches the limit, which cancels the transaction and issues a
+        # Finished (cancel) PDU. That PDU gets its own positive ACK procedure.
+        time.sleep(self.timeout_positive_ack_procedure_seconds * 1.1)
+        fsm_res = self.dest_handler.state_machine()
+        self._generic_finished_pdu_with_error_check(
+            fsm_res,
+            ConditionCode.POSITIVE_ACK_LIMIT_REACHED,
+            DeliveryCode.DATA_COMPLETE,
+            FileStatus.FILE_RETAINED,
+        )
+
+        # One retransmission of the Finished (cancel) PDU ...
+        time.sleep(self.timeout_positive_ack_procedure_seconds * 1.1)
+        fsm_res = self.dest_handler.state_machine()
+        self._state_checker(fsm_res, 1, CfdpState.BUSY, TransactionStep.WAITING_FOR_FINISHED_ACK)
+        self.dest_handler.get_next_packet()
+
+        # ... and then the transaction is abandoned and the handler is usable again.
+        time.sleep(self.timeout_positive_ack_procedure_seconds * 1.1)
+        fsm_res = self.dest_handler.state_machine()
+        self._state_checker(fsm_res, 0, CfdpState.IDLE, TransactionStep.IDLE)
+        self.fault_handler.abandoned_cb.assert_called_once()
+        self.assertEqual(
+            self.fault_handler.abandoned_cb.call_args.args[1],
+            ConditionCode.POSITIVE_ACK_LIMIT_REACHED,
+        )
+        # The notice of completion must not be repeated per expiration.
+        self.assertEqual(self.cfdp_user.transaction_finished_indication.call_count, 2)
+
+    def test_positive_ack_limit_abandon_fault_handler_does_not_crash(self):
+        """A user which maps POSITIVE_ACK_LIMIT_REACHED to ABANDON_TRANSACTION resets the handler
+        from inside the fault declaration, so the positive ACK procedure must not keep working on
+        the discarded transaction parameters afterwards."""
+        self.local_cfg.default_fault_handlers.set_handler(
+            ConditionCode.POSITIVE_ACK_LIMIT_REACHED, FaultHandlerCode.ABANDON_TRANSACTION
+        )
+        self._generic_regular_transfer_init(0)
+        fsm_res = self._generic_insert_eof_pdu(0, NULL_CHECKSUM_U32)
+        self._generic_verify_eof_ack_packet(fsm_res, TransactionStep.WAITING_FOR_FINISHED_ACK)
+        self._generic_no_error_finished_pdu_check_acked(fsm_res)
+        self._generic_verify_transfer_completion(fsm_res, b"")
+        for _ in range(self.remote_cfg.positive_ack_timer_expiration_limit):
+            time.sleep(self.timeout_positive_ack_procedure_seconds * 1.1)
+            fsm_res = self.dest_handler.state_machine()
+            while self.dest_handler.num_packets_ready > 0:
+                self.dest_handler.get_next_packet()
+        self._state_checker(None, 0, CfdpState.IDLE, TransactionStep.IDLE)
+
+    def test_lost_segment_handling_clears_gap_matching_last_received_window(self):
+        """White box regression test. On a lossy link a span can end up being both the most
+        recently received window and a tracked gap. The removal used to be decided by comparing
+        the end of the received segment against the START of that window, which such a
+        retransmission never satisfies, so the gap stayed in the tracker: the destination
+        re-requested data it had already written on every NAK round until it hit its NAK limit,
+        with the transfer stuck at full progress."""
+        self._generic_regular_transfer_init(12)
+        acked = self.dest_handler._params.acked_params
+        acked.lost_seg_tracker.add_lost_segment((8, 12))
+        acked.last_start_offset = 8
+        acked.last_end_offset = 12
+
+        self.dest_handler._lost_segment_handling(8, 4)
+        self.assertEqual(acked.lost_seg_tracker.lost_segments, [])
+
+    def test_lost_segment_tracker_is_not_shared_between_handlers(self):
+        """The tracker used to be a mutable dataclass default, so it was created once at class
+        definition time and shared by every parameter set: all handlers in a process, and every
+        transaction of a single handler, accumulated their gaps in the same list."""
+        other_handler = DestHandler(
+            self.local_cfg,
+            self.cfdp_user,
+            self.remote_cfg_table,
+            CheckTimerProviderForTest(timeout_dest_entity_ms=self.timeout_check_limit_handling_ms),
+        )
+        self.dest_handler._params.acked_params.lost_seg_tracker.add_lost_segment((0, 4))
+        self.assertEqual(
+            other_handler._params.acked_params.lost_seg_tracker.lost_segments,
+            [],
         )
 
     def test_metadata_only_transfer(self):

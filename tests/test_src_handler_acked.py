@@ -26,7 +26,7 @@ from spacepackets.cfdp.pdu import (
 )
 
 from cfdppy.defs import CfdpState
-from cfdppy.handler.source import TransactionStep
+from cfdppy.handler.source import TransactionStep, acknowledge_inactive_finished_pdu
 
 from .test_src_handler import TestCfdpSourceHandler
 
@@ -213,6 +213,45 @@ class TestSourceHandlerAcked(TestCfdpSourceHandler):
         assert next_pdu is None
         self.source_handler.state_machine()
         self._generic_acked_transfer_completion_full_success(transaction_params.id, eof_pdu)
+
+    def test_acknowledge_inactive_finished_pdu(self):
+        """The source handler resets as soon as it has queued the ACK for the Finished PDU, so it
+        cannot answer a retransmission of that Finished PDU itself. Without an acknowledgment the
+        receiver retransmits to its positive ACK limit and declares a fault at the end of a
+        transfer which actually succeeded, so the application has to answer on its behalf."""
+        transaction_id, _, initial_eof_pdu = self._common_empty_file_test(None)
+        self._generic_acked_transfer_completion_full_success(transaction_id, initial_eof_pdu)
+        self._state_checker(None, 0, CfdpState.IDLE, TransactionStep.IDLE)
+
+        finished_pdu = FinishedPdu(
+            params=FinishedParams(
+                condition_code=ConditionCode.NO_ERROR,
+                file_status=FileStatus.FILE_RETAINED,
+                delivery_code=DeliveryCode.DATA_COMPLETE,
+            ),
+            pdu_conf=initial_eof_pdu.pdu_header.pdu_conf,
+        )
+        ack_pdu = acknowledge_inactive_finished_pdu(finished_pdu, TransactionStatus.TERMINATED)
+        self.assertEqual(ack_pdu.directive_code_of_acked_pdu, DirectiveType.FINISHED_PDU)
+        self.assertEqual(ack_pdu.condition_code_of_acked_pdu, ConditionCode.NO_ERROR)
+        self.assertEqual(ack_pdu.transaction_status, TransactionStatus.TERMINATED)
+        self.assertEqual(ack_pdu.direction, Direction.TOWARDS_RECEIVER)
+        self.assertEqual(ack_pdu.transaction_seq_num, finished_pdu.transaction_seq_num)
+        self.assertEqual(ack_pdu.source_entity_id, finished_pdu.source_entity_id)
+        # The handler stays untouched, this is a stateless helper.
+        self._state_checker(None, 0, CfdpState.IDLE, TransactionStep.IDLE)
+
+    def test_acknowledge_inactive_finished_pdu_rejects_active_status(self):
+        finished_pdu = FinishedPdu(
+            params=FinishedParams(
+                condition_code=ConditionCode.NO_ERROR,
+                file_status=FileStatus.FILE_RETAINED,
+                delivery_code=DeliveryCode.DATA_COMPLETE,
+            ),
+            pdu_conf=PduConfig.default(),
+        )
+        with self.assertRaises(ValueError):
+            acknowledge_inactive_finished_pdu(finished_pdu, TransactionStatus.ACTIVE)
 
     def _generic_acked_transfer_completion_full_success(
         self, transaction_id: TransactionId, eof_pdu: EofPdu

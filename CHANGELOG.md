@@ -8,6 +8,53 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 # [unreleased]
 
+## Added
+
+- `cfdppy.handler.source.acknowledge_inactive_finished_pdu`, the counterpart of the existing
+  `acknowledge_inactive_eof_pdu`. A source handler resets as soon as it has queued the ACK for
+  the Finished PDU, so it retains no state to answer a retransmission of that Finished PDU if
+  the ACK was lost. Without an acknowledgment the receiving entity retransmits to its positive
+  ACK limit and declares `POSITIVE_ACK_LIMIT_REACHED` at the end of a transfer which actually
+  succeeded.
+
+## Fixed
+
+- The destination handler no longer livelocks when the ACK for its Finished PDU never arrives.
+  Reaching the positive ACK limit cancelled the transaction, which re-ran the notice of
+  completion, re-sent the Finished PDU and restarted the positive ACK procedure with a fresh
+  counter, so the handler never left `WAITING_FOR_FINISHED_ACK`: it emitted a Finished PDU and a
+  transaction finished indication on every single expiration, for as long as the process lived,
+  and could never accept another transaction. Per CFDP 4.11.2.2.3 a fault declared while
+  transferring the cancel PDU now abandons the transaction, which is the rule the source handler
+  already applied to its own EOF (cancel) PDU. A fault handler configured as
+  `ABANDON_TRANSACTION` for `POSITIVE_ACK_LIMIT_REACHED` also no longer crashes the positive ACK
+  procedure with an `AttributeError`.
+- A retransmitted file data PDU which exactly refilled the most recently received window no
+  longer leaves its gap in the lost segment tracker. The removal was decided by comparing the end
+  of the received segment against the *start* of that window rather than its end, a condition such
+  a retransmission never satisfies, so the destination re-requested data it had already written on
+  every NAK round until it reached its NAK limit, with the transfer stuck at full progress.
+- `_AckedModeParams.lost_seg_tracker` used a mutable dataclass default, so a single
+  `LostSegmentTracker` was created at class definition time and shared by every parameter set:
+  all destination handlers in a process, and every transaction of a single handler, accumulated
+  their lost segments in the same list.
+- The destination handler now re-acknowledges a duplicate EOF PDU received in the
+  `WAITING_FOR_MISSING_DATA`, `TRANSFER_COMPLETION`, `SENDING_FINISHED_PDU` and
+  `WAITING_FOR_FINISHED_ACK` steps. Per CFDP 4.7.2 every EOF PDU must be acknowledged, and a
+  duplicate means the previous ACK was lost: the sender retransmits the EOF on its positive ACK
+  timer and would otherwise reach its limit while the receiver silently discarded every copy.
+  The transaction state is left untouched, only the ACK is re-issued, and the ACK carries the
+  condition code of the EOF PDU it acknowledges.
+- A metadata PDU which arrives while the deferred lost segment procedure is active no longer
+  moves the destination handler back to `RECEIVING_FILE_DATA`. The EOF PDU has already been
+  handled and acknowledged at that point, so the sender has no reason to send another one and
+  the handler waited for it forever with its remaining gaps never re-requested. It now continues
+  in `WAITING_FOR_MISSING_DATA`.
+- The destination handler retains the checksum of an EOF PDU which arrived before the metadata
+  PDU. It was dropped, so a transaction which recovered from a lost metadata PDU completed
+  against the empty default checksum and reported `FILE_CHECKSUM_FAILURE` for a file that had
+  arrived intact.
+
 # [v0.7.0] 2026-09-08
 
 - Bump allowed `spacepackets` to >=0.30, <0.33
