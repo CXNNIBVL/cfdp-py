@@ -560,6 +560,7 @@ class DestHandler:
             # otherwise the sender retransmits to its limit and declares a fault at the end of an
             # otherwise successful transfer. The transaction state itself is left alone, the EOF
             # was already fully processed when the first copy arrived.
+            # The packet is consumed for robustness, it was handled here.
             self._prepare_eof_ack_packet(pdu_holder.to_eof_pdu().condition_code)
             packet = None
             pdu_holder = PduHolder(None)
@@ -573,9 +574,10 @@ class DestHandler:
         ):
             self._handle_fd_or_eof_pdu(pdu_holder)
         if self.states.step == TransactionStep.WAITING_FOR_METADATA:
-            self._handle_waiting_for_missing_metadata(pdu_holder)
-            # The metadata handling can leave this step, in which case the deferred procedure is
-            # serviced by the step which was entered instead.
+            self._handle_waiting_for_missing_metadata(pdu_holder)          
+            # _handle_waiting_for_missing_metadata moves the step to WAITING_FOR_MISSING_DATA when the
+            # deferred procedure was waiting on this metadata. That step's own block below then services
+            # the deferred procedure, so only run it here if we are still waiting for metadata.
             if (
                 self.states.step == TransactionStep.WAITING_FOR_METADATA
                 and self._params.acked_params.deferred_lost_segment_detection_active
@@ -823,11 +825,11 @@ class DestHandler:
             self._handle_metadata_packet(packet_holder.to_metadata_pdu())
             # Reception of missing segments resets the NAK activity parameters. See CFDP 4.6.4.7.
             if self._params.acked_params.deferred_lost_segment_detection_active:
-                # The EOF PDU was already handled and acknowledged, so the sender has no reason
-                # to send another one. _handle_metadata_packet moves the step back to
-                # RECEIVING_FILE_DATA, which waits for exactly that and would strand the
-                # transaction with its remaining gaps never re-requested. The metadata is no
-                # longer missing, so continue the deferred procedure for the file data.
+                  # We only get here with the deferred procedure already active if the EOF PDU arrived
+                  # before this metadata PDU: _handle_eof_without_previous_metadata already answered it
+                  # and started the deferred procedure. _handle_metadata_packet just set the step to
+                  # RECEIVING_FILE_DATA, which waits for an EOF that will never come, stranding any
+                  # remaining gaps. Route to WAITING_FOR_MISSING_DATA instead to keep servicing them.
                 self.states.step = TransactionStep.WAITING_FOR_MISSING_DATA
                 self._reset_nak_activity_parameters()
         elif packet_holder.pdu_directive_type == DirectiveType.EOF_PDU:  # type: ignore
@@ -941,9 +943,9 @@ class DestHandler:
     def _lost_segment_handling(self, offset: int, data_len: int) -> None:
         """Lost segment detection: 4.6.4.3.1 a) and b) are covered by this code. c) is covered
         by dedicated code which is run when the EOF PDU is handled."""
-        # The end of the most recently received segment has to be sampled before the bookkeeping
-        # below updates it, because the decision whether this PDU extends the forward flow or
-        # fills an existing gap depends on the previous value.
+          # Capture last_end_offset before updating it below. The branches that follow need the
+          # old value, not the new one, to tell whether this PDU extends the received range or
+          # just fills a gap inside it.
         previous_end_offset = self._params.acked_params.last_end_offset
         if offset > previous_end_offset:
             lost_segment = (previous_end_offset, offset)
@@ -963,12 +965,7 @@ class DestHandler:
             self._params.acked_params.last_end_offset = offset + data_len
         elif offset + data_len <= previous_end_offset:
             # The segment lies inside what was already received, so it can only be filling a gap:
-            # a re-requested FD PDU, or one which arrived out of order. This used to be compared
-            # against last_start_offset, which is the start of the most recently received segment
-            # rather than the end of the received region. A retransmission which exactly refilled
-            # that most recent window therefore matched none of the branches and the gap stayed in
-            # the tracker, so the destination re-requested the same segment on every NAK round
-            # until it reached its NAK limit, even though the data had arrived and been written.
+            # a re-requested FD PDU, or one which arrived out of order.
             removed = self._params.acked_params.lost_seg_tracker.remove_lost_segment(
                 (offset, offset + data_len)
             )
