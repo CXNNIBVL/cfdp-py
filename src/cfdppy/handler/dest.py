@@ -574,10 +574,10 @@ class DestHandler:
         ):
             self._handle_fd_or_eof_pdu(pdu_holder)
         if self.states.step == TransactionStep.WAITING_FOR_METADATA:
-            self._handle_waiting_for_missing_metadata(pdu_holder)          
-            # _handle_waiting_for_missing_metadata moves the step to WAITING_FOR_MISSING_DATA when the
-            # deferred procedure was waiting on this metadata. That step's own block below then services
-            # the deferred procedure, so only run it here if we are still waiting for metadata.
+            self._handle_waiting_for_missing_metadata(pdu_holder)
+            # This moves the step to WAITING_FOR_MISSING_DATA if the deferred procedure was
+            # waiting on this metadata. That block below then services the deferred procedure,
+            # so only run it here if we are still waiting for metadata.
             if (
                 self.states.step == TransactionStep.WAITING_FOR_METADATA
                 and self._params.acked_params.deferred_lost_segment_detection_active
@@ -825,11 +825,12 @@ class DestHandler:
             self._handle_metadata_packet(packet_holder.to_metadata_pdu())
             # Reception of missing segments resets the NAK activity parameters. See CFDP 4.6.4.7.
             if self._params.acked_params.deferred_lost_segment_detection_active:
-                  # We only get here with the deferred procedure already active if the EOF PDU arrived
-                  # before this metadata PDU: _handle_eof_without_previous_metadata already answered it
-                  # and started the deferred procedure. _handle_metadata_packet just set the step to
-                  # RECEIVING_FILE_DATA, which waits for an EOF that will never come, stranding any
-                  # remaining gaps. Route to WAITING_FOR_MISSING_DATA instead to keep servicing them.
+                # We only get here with the deferred procedure already active if the EOF PDU
+                # arrived before this metadata PDU: _handle_eof_without_previous_metadata already
+                # answered it and started the deferred procedure. _handle_metadata_packet just set
+                # the step to RECEIVING_FILE_DATA, which waits for an EOF that will never come,
+                # stranding any remaining gaps. Route to WAITING_FOR_MISSING_DATA to keep servicing
+                # them.
                 self.states.step = TransactionStep.WAITING_FOR_MISSING_DATA
                 self._reset_nak_activity_parameters()
         elif packet_holder.pdu_directive_type == DirectiveType.EOF_PDU:  # type: ignore
@@ -943,9 +944,9 @@ class DestHandler:
     def _lost_segment_handling(self, offset: int, data_len: int) -> None:
         """Lost segment detection: 4.6.4.3.1 a) and b) are covered by this code. c) is covered
         by dedicated code which is run when the EOF PDU is handled."""
-          # Capture last_end_offset before updating it below. The branches that follow need the
-          # old value, not the new one, to tell whether this PDU extends the received range or
-          # just fills a gap inside it.
+        # Capture last_end_offset before updating it below. The branches that follow need the
+        # old value, not the new one, to tell whether this PDU extends the received range or
+        # just fills a gap inside it.
         previous_end_offset = self._params.acked_params.last_end_offset
         if offset > previous_end_offset:
             lost_segment = (previous_end_offset, offset)
